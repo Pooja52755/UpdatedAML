@@ -403,16 +403,16 @@ if page == "Dashboard":
             st.session_state.goto_graph = True
             st.rerun()
 
-        # ── Fan-Out Sub-Transaction Table ──
-        st.html('<div class="section-label">Transaction Routing Flow</div>')
+        # ── Fan-Out Sub-Transaction Table (Source + Receivers) ──
+        st.html('<div class="section-label">Transaction Routing Flow (Source & Receivers)</div>')
 
-        fan_rows = fraud_data.get_fan_out_rows(st.session_state.selected_tx_id)
+        fan_rows = fraud_data.get_fan_out_rows(st.session_state.selected_tx_id, include_source=True)
         if fan_rows:
             df_fan = pd.DataFrame(fan_rows)
-            df_display = df_fan[["sub_tx_id", "to_account", "amount", "time", "payment_format", "gat_signal"]].copy()
-            df_display.columns = ["Sub-TX ID", "To Account", "Amount", "Timestamp", "Payment Format", "GAT Signal"]
+            df_display = df_fan[["role", "account", "to_entity_name", "amount", "time", "payment_format", "gat_signal"]].copy()
+            df_display.columns = ["Role", "Account Number", "Entity Name", "Amount", "Timestamp", "Payment Format", "GAT Signal"]
         else:
-            df_display = pd.DataFrame(columns=["Sub-TX ID", "To Account", "Amount", "Timestamp", "Payment Format", "GAT Signal"])
+            df_display = pd.DataFrame(columns=["Role", "Account Number", "Entity Name", "Amount", "Timestamp", "Payment Format", "GAT Signal"])
 
         # Clickable table with row selection
         event = st.dataframe(
@@ -433,7 +433,7 @@ if page == "Dashboard":
 
         st.html("""
         <div style="font-size:10.5px;color:#94a3b8;margin-top:4px;">
-            🖱️ Click a row to view the receiver's customer profile in the right panel.
+            🖱️ Click any row (Source Sender or Receiver) to view its customer profile in the right panel.
         </div>
         """)
 
@@ -460,8 +460,8 @@ if page == "Dashboard":
         </div>
         """))
 
-        # ── Authorised Bank Auditor Decision Panel (HIGH RISK ONLY) ──
-        if is_high:
+        # ── Authorised Bank Auditor Decision Panel (HIGH & MEDIUM RISK) ──
+        if is_high or risk == "Medium":
             tx_key = curr_tx.get("tx_id", f"GROUP-{gid}")
             already_submitted = st.session_state.human_decision_submitted.get(tx_key)
 
@@ -529,105 +529,120 @@ if page == "Dashboard":
         """))
 
     # ════════════════════════════════════════════════════════════════════
-    #  RIGHT PANEL — Customer Profile (receiver, on row click)
+    #  RIGHT PANEL — Customer Profile (Source or Receiver)
     # ════════════════════════════════════════════════════════════════════
     with col_right:
         sub_tx = st.session_state.selected_sub_tx
 
         if sub_tx is None:
-            st.html(textwrap.dedent("""
-            <div class="profile-card">
-                <div class="section-label">Receiver Profile</div>
-                <div class="profile-empty">
-                    <div style="font-size:40px;margin-bottom:12px;">👤</div>
-                    <div style="font-size:13px;font-weight:600;color:#64748b;">No row selected</div>
-                    <div style="font-size:12px;margin-top:6px;color:#94a3b8;">
-                        Click any transaction row in the center table to view the receiver's customer profile here.
-                    </div>
+            # Default to showing the Source Account's profile
+            source_acc = curr_tx.get("account", "—")
+            sub_tx = {
+                "account": source_acc,
+                "to_account": source_acc,
+                "is_source": True,
+                "to_entity_name": curr_tx.get("name", "—"),
+                "to_bank_name": curr_tx.get("bank_name", "—"),
+                "to_bank_id": curr_tx.get("bank_id", "—"),
+                "to_entity_id": curr_tx.get("entity_id", "—"),
+                "payment_format": curr_tx.get("payment_format", "Wire"),
+                "gat_signal": curr_tx.get("gat_signal", "HIGH"),
+                "amount": curr_tx.get("amount_formatted", "—"),
+            }
+
+        acc_num = sub_tx.get("account") or sub_tx.get("to_account", "—")
+        is_src = sub_tx.get("is_source", False)
+        profile_label = "Source Sender Profile" if is_src else "Receiver Profile"
+
+        try:
+            profile = fraud_data.get_customer_profile(acc_num)
+        except Exception:
+            profile = {}
+
+        if not isinstance(profile, dict):
+            profile = {}
+
+        # Direct fallback to selected row metadata
+        profile_name = profile.get("name") if profile.get("name") not in ("—", "Unknown", None, "") else sub_tx.get("to_entity_name", acc_num)
+        bank_name = profile.get("bank_name") if profile.get("bank_name") not in ("—", None, "") else sub_tx.get("to_bank_name", "—")
+        bank_id = profile.get("bank_id") if profile.get("bank_id") not in ("—", None, "") else sub_tx.get("to_bank_id", "—")
+        entity_id = profile.get("entity_id") if profile.get("entity_id") not in ("—", None, "") else sub_tx.get("to_entity_id", "—")
+        tot_inc = profile.get("total_incoming") if profile.get("total_incoming") not in ("—", None, "") else sub_tx.get("amount", "—")
+        tot_out = profile.get("total_outgoing", "—")
+        avg_in = profile.get("avg_incoming_amount", "—")
+        avg_out = profile.get("avg_outgoing_amount", "—")
+        max_in = profile.get("max_incoming_amount", "—")
+        max_out = profile.get("max_outgoing_amount", "—")
+        in_tx = profile.get("previous_incoming", sub_tx.get("previous_incoming", "—"))
+        out_tx = profile.get("previous_outgoing", sub_tx.get("previous_outgoing", "—"))
+        uniq_snds = profile.get("unique_senders", "—")
+        uniq_recs = profile.get("unique_receivers", "—")
+        tot_deg = profile.get("total_degree", "—")
+        net_flow = profile.get("net_flow", "—")
+
+        risk_tier = profile.get("risk_tier", "High Risk" if "HIGH" in str(sub_tx.get("gat_signal", "HIGH")).upper() else ("Medium Risk" if "MEDIUM" in str(sub_tx.get("gat_signal", "")).upper() else "Low Risk"))
+        tier_color = "#dc2626" if "High" in risk_tier else "#d97706" if "Medium" in risk_tier else "#16a34a"
+        payment_fmt = str(sub_tx.get('payment_format', '—'))
+
+        beh_rows = [
+            ("Total Incoming Amount", tot_inc),
+            ("Average Incoming Amount", avg_in),
+            ("Maximum Incoming Amount", max_in),
+            ("Incoming Transactions", str(in_tx)),
+            ("Unique Senders", str(uniq_senders) if (uniq_senders := uniq_snds) else str(uniq_snds)),
+            ("Total Outgoing Amount", tot_out),
+            ("Average Outgoing Amount", avg_out),
+            ("Maximum Outgoing Amount", max_out),
+            ("Outgoing Transactions", str(out_tx)),
+            ("Unique Receivers", str(uniq_recs)),
+            ("Total Degree", str(tot_deg)),
+            ("Net Flow", net_flow),
+        ]
+        beh_rows_html = "".join([f"<tr><td><b>{r[0]}</b></td><td style='text-align:right;'>{r[1]}</td></tr>" for r in beh_rows if r[1] != "—" and r[1] != ""])
+
+        st.html(textwrap.dedent(f"""
+        <div class="profile-card">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
+                <div>
+                    <div class="section-label">{profile_label}</div>
+                    <div style="font-size:16px;font-weight:800;color:#0f172a;">{profile_name}</div>
+                    <div style="font-size:12px;color:#64748b;margin-top:2px;">Account: <b>{acc_num}</b></div>
+                </div>
+                <div style="text-align:right;">
+                    <span style="background:{tier_color}20;color:{tier_color};border:1px solid {tier_color}44;
+                                 padding:3px 10px;border-radius:6px;font-size:11px;font-weight:700;">
+                        {risk_tier}
+                    </span>
                 </div>
             </div>
-            """))
-        else:
-            to_acc = sub_tx.get("to_account", "—")
-            try:
-                profile = fraud_data.get_receiver_profile(to_acc, curr_tx.get("group_id"))
-            except Exception:
-                try:
-                    profile = fraud_data.get_receiver_profile(to_acc)
-                except Exception:
-                    profile = {}
 
-            if not isinstance(profile, dict):
-                profile = {}
-
-            # Direct fallback to selected row metadata
-            profile_name = profile.get("name") if profile.get("name") not in ("—", "Unknown", None, "") else sub_tx.get("to_entity_name", to_acc)
-            bank_name = profile.get("bank_name") if profile.get("bank_name") not in ("—", None, "") else sub_tx.get("to_bank_name", "—")
-            bank_id = profile.get("bank_id") if profile.get("bank_id") not in ("—", None, "") else sub_tx.get("to_bank_id", "—")
-            entity_id = profile.get("entity_id") if profile.get("entity_id") not in ("—", None, "") else sub_tx.get("to_entity_id", "—")
-            tot_inc = profile.get("total_incoming") if profile.get("total_incoming") not in ("—", None, "") else sub_tx.get("amount", "—")
-            avg_amt = profile.get("avg_tx_amount") if profile.get("avg_tx_amount") not in ("—", None, "") else sub_tx.get("amount", "—")
-            risk_tier = profile.get("risk_tier", "High Risk" if "HIGH" in str(sub_tx.get("gat_signal", "HIGH")).upper() else "Low Risk")
-            tier_color = "#dc2626" if "High" in risk_tier else "#d97706" if "Medium" in risk_tier else "#16a34a"
-
-            prev_in = str(sub_tx.get('previous_incoming', profile.get('previous_incoming', '—')))
-            prev_out = str(sub_tx.get('previous_outgoing', profile.get('previous_outgoing', '—')))
-            payment_fmt = str(sub_tx.get('payment_format', '—'))
-
-            beh_rows = [
-                ("Total Incoming", tot_inc),
-                ("Unique Senders", prev_in),
-                ("Unique Receivers", prev_out),
-                ("Avg Tx Amount", avg_amt),
-                ("Total Transactions", str(profile.get("total_transactions", "1"))),
-                ("Entity ID", entity_id),
-                ("Bank ID", bank_id),
-            ]
-            beh_rows_html = "".join([f"<tr><td><b>{r[0]}</b></td><td style='text-align:right;'>{r[1]}</td></tr>" for r in beh_rows])
-
-            st.html(textwrap.dedent(f"""
-            <div class="profile-card">
-                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
-                    <div>
-                        <div class="section-label">Receiver Profile</div>
-                        <div style="font-size:16px;font-weight:800;color:#0f172a;">{profile_name}</div>
-                        <div style="font-size:12px;color:#64748b;margin-top:2px;">Account: <b>{to_acc}</b></div>
-                    </div>
-                    <div style="text-align:right;">
-                        <span style="background:{tier_color}20;color:{tier_color};border:1px solid {tier_color}44;
-                                     padding:3px 10px;border-radius:6px;font-size:11px;font-weight:700;">
-                            {risk_tier}
-                        </span>
-                    </div>
+            <div class="profile-metric-grid">
+                <div class="profile-metric-card">
+                    <div class="profile-metric-label">Bank Name</div>
+                    <div class="profile-metric-val" style="font-size:12px;">{bank_name}</div>
                 </div>
-
-                <div class="profile-metric-grid">
-                    <div class="profile-metric-card">
-                        <div class="profile-metric-label">Bank Name</div>
-                        <div class="profile-metric-val" style="font-size:12px;">{bank_name}</div>
-                    </div>
-                    <div class="profile-metric-card">
-                        <div class="profile-metric-label">Bank ID</div>
-                        <div class="profile-metric-val">{bank_id}</div>
-                    </div>
-                    <div class="profile-metric-card">
-                        <div class="profile-metric-label">Entity ID</div>
-                        <div class="profile-metric-val">{entity_id}</div>
-                    </div>
-                    <div class="profile-metric-card">
-                        <div class="profile-metric-label">Payment Format</div>
-                        <div class="profile-metric-val" style="font-size:12px;">{payment_fmt}</div>
-                    </div>
+                <div class="profile-metric-card">
+                    <div class="profile-metric-label">Bank ID</div>
+                    <div class="profile-metric-val">{bank_id}</div>
                 </div>
-
-                <div style="font-size:12px;font-weight:700;color:#1e293b;margin-bottom:6px;">Financial Summary</div>
-                <table class="custom-table">
-                    <tbody>
-                        {beh_rows_html}
-                    </tbody>
-                </table>
+                <div class="profile-metric-card">
+                    <div class="profile-metric-label">Entity ID</div>
+                    <div class="profile-metric-val">{entity_id}</div>
+                </div>
+                <div class="profile-metric-card">
+                    <div class="profile-metric-label">Payment Format</div>
+                    <div class="profile-metric-val" style="font-size:12px;">{payment_fmt}</div>
+                </div>
             </div>
-            """))
+
+            <div style="font-size:12px;font-weight:700;color:#1e293b;margin-bottom:6px;">Financial Summary</div>
+            <table class="custom-table">
+                <tbody>
+                    {beh_rows_html}
+                </tbody>
+            </table>
+        </div>
+        """))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
