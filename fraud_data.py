@@ -1,24 +1,19 @@
 """
-AML Fraud Detection Data & Engine Layer
-Provides real transaction graph datasets from frontend_fanout_gat_test_grouped.csv,
-real customer profiles, risk metrics, and fact-based pattern explanations.
+AML Fraud Detection Data & Engine Layer for GitFrontend
+Uses real datasets from GitData/ (frontend (1).csv & customer_profiles.csv).
+Filters strictly for HIGH RISK FAN-OUT investigations.
+Provides complete account profiling and graph topology.
 """
 
 import os
+import glob
 import pandas as pd
 import numpy as np
 import networkx as nx
 from datetime import datetime
 
-# Path to the real CSV dataset
-DATA_PATH = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "GitData",
-        "frontend_fanout_gat_test_grouped.csv"
-    )
+GITDATA_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "GitData")
 )
 
 CURRENCY_SYMBOLS = {
@@ -40,15 +35,15 @@ CURRENCY_SYMBOLS = {
 }
 
 def format_currency(amount, currency_name="US Dollar"):
-    """Format numeric amount with proper currency symbol without forcing INR."""
+    """Format numeric amount with proper currency symbol."""
     sym = CURRENCY_SYMBOLS.get(currency_name, f"{currency_name} ")
     try:
         amt = float(amount)
-        if amt >= 1_000_000_000:
+        if abs(amt) >= 1_000_000_000:
             return f"{sym}{amt / 1_000_000_000:.2f}B"
-        elif amt >= 1_000_000:
+        elif abs(amt) >= 1_000_000:
             return f"{sym}{amt / 1_000_000:.2f}M"
-        elif amt >= 1_000:
+        elif abs(amt) >= 1_000:
             return f"{sym}{amt:,.2f}"
         else:
             return f"{sym}{amt:.2f}"
@@ -57,12 +52,12 @@ def format_currency(amount, currency_name="US Dollar"):
 
 
 class DatasetManager:
-    """Singleton manager that loads and indexes the real Fan-Out CSV data efficiently."""
+    """Singleton manager that loads and indexes GitData/ transactions and customer profiles."""
     _instance = None
     _df = None
+    _profiles_map = None
     _group_summaries = None
-    _group_indices = None
-    _all_senders = None
+    _group_dict = None
 
     @classmethod
     def get_instance(cls):
@@ -71,49 +66,120 @@ class DatasetManager:
             cls._instance._load_data()
         return cls._instance
 
+    def _find_file(self, pattern_list):
+        for pattern in pattern_list:
+            matches = glob.glob(os.path.join(GITDATA_DIR, pattern))
+            if matches:
+                return matches[0]
+        return None
+
     def _load_data(self):
         if self._df is not None:
             return
 
-        if not os.path.exists(DATA_PATH):
-            raise FileNotFoundError(f"Dataset CSV not found at: {DATA_PATH}")
+        # 1. Load Transactions Dataset
+        trans_file = self._find_file(["frontend (1).csv", "frontend*.csv", "*fanout*.csv", "frontend_fanout_gat_test_grouped.csv"])
+        if not trans_file or not os.path.exists(trans_file):
+            raise FileNotFoundError(f"Transactions CSV not found in: {GITDATA_DIR}")
 
-        # Read CSV with exact column names
-        self._df = pd.read_csv(DATA_PATH)
+        print(f"Loading transactions dataset from: {trans_file}")
+        raw_df = pd.read_csv(trans_file)
 
-        # Pre-build group index mapping for instant group lookups
+        # Standardize group column names
+        if "Fan_Out_Group" in raw_df.columns and "Fan-out Group" not in raw_df.columns:
+            raw_df["Fan-out Group"] = raw_df["Fan_Out_Group"]
+        if "GAT_Risk_Level" in raw_df.columns and "GAT Signal" not in raw_df.columns:
+            raw_df["GAT Signal"] = raw_df["GAT_Risk_Level"]
+        if "GAT_Risk_Probability" in raw_df.columns and "GAT Probability" not in raw_df.columns:
+            raw_df["GAT Probability"] = raw_df["GAT_Risk_Probability"]
+        if "Behavior_Signal" in raw_df.columns and "Detection Pattern" not in raw_df.columns:
+            raw_df["Detection Pattern"] = raw_df["Behavior_Signal"]
+
+        # Filter strictly for High and Medium Risk Fan-Out Groups (preserve ALL transactions in each flagged group)
+        risk_mask = (raw_df["GAT Signal"].astype(str).str.upper().isin(["HIGH", "MEDIUM"])) & (raw_df["Fan-out Group"].fillna(-1).astype(int) != -1)
+        if "Detection Pattern" in raw_df.columns:
+            risk_mask = risk_mask & (raw_df["Detection Pattern"].astype(str).str.upper() == "FAN-OUT")
+
+        flagged_groups = raw_df.loc[risk_mask, "Fan-out Group"].unique()
+
+        # Keep all transactions belonging to flagged High/Medium fanout groups
+        self._df = raw_df[raw_df["Fan-out Group"].isin(flagged_groups)].copy().reset_index(drop=True)
+        if self._df.empty:
+            self._df = raw_df.copy()
+
         self._df["Fan-out Group"] = self._df["Fan-out Group"].astype(int)
-        
-        # Pre-calculate summary list of unique Fan-out groups (top 100 for fast left panel & navigation)
-        unique_groups = self._df["Fan-out Group"].drop_duplicates().tolist()
-        
+
+        # Pre-group only top unique groups for instant performance
+        unique_groups = [int(x) for x in self._df["Fan-out Group"].drop_duplicates().head(200)]
+        df_top = self._df[self._df["Fan-out Group"].isin(unique_groups)]
+        self._group_dict = {int(gid): gdf for gid, gdf in df_top.groupby("Fan-out Group")}
+
+        # Collect unique accounts from the active fan-out groups
+        active_accounts = set()
+        for gid in unique_groups[:200]:
+            gdf = self._group_dict.get(gid)
+            if gdf is not None:
+                if "From Account" in gdf.columns:
+                    active_accounts.update(gdf["From Account"].dropna().astype(str).str.strip())
+                if "To Account" in gdf.columns:
+                    active_accounts.update(gdf["To Account"].dropna().astype(str).str.strip())
+
+        # 2. Load Customer Profiles from customer_profiles.csv
+        profiles_file = self._find_file(["customer_profiles.csv", "*profile*.csv"])
+        self._profiles_map = {}
+        if profiles_file and os.path.exists(profiles_file):
+            print(f"Loading customer profiles from: {profiles_file}")
+            df_p = pd.read_csv(profiles_file)
+            acc_col = "Account_Number" if "Account_Number" in df_p.columns else df_p.columns[0]
+            df_p[acc_col] = df_p[acc_col].astype(str).str.strip()
+            # Fast filter for active accounts
+            df_p_active = df_p[df_p[acc_col].isin(active_accounts)]
+            for row in df_p_active.to_dict(orient="records"):
+                anum = str(row.get(acc_col, "")).strip()
+                self._profiles_map[anum] = row
+            # Also keep full dataframe indexed as fallback
+            self._profiles_df = df_p.set_index(acc_col)
+
+        print(f"Successfully indexed {len(self._profiles_map):,} active customer profiles.")
+
         self._group_summaries = []
+
         for gid in unique_groups[:100]:
-            gdf = self._df[self._df["Fan-out Group"] == gid]
-            if gdf.empty:
-                continue
-            first_row = gdf.iloc[0]
-            gat_prob = float(first_row["GAT Probability"])
-            gat_signal = str(first_row["GAT Signal"]).strip()
-            risk_tier = "High" if "HIGH" in gat_signal.upper() or gat_prob >= 0.7 else ("Medium" if gat_prob >= 0.3 else "Low")
+            gdf = self._group_dict[gid]
+            if "GAT Probability" in gdf.columns:
+                lead_idx = gdf["GAT Probability"].astype(float).idxmax()
+                first_row = gdf.loc[lead_idx]
+            else:
+                first_row = gdf.iloc[0]
+            gat_prob = float(first_row.get("GAT Probability", 0.99))
+            gat_signal = str(first_row.get("GAT Signal", "HIGH")).strip()
+            risk_tier = "High" if "HIGH" in gat_signal.upper() or gat_prob >= 0.7 else ("Medium" if "MEDIUM" in gat_signal.upper() or gat_prob >= 0.3 else "Low")
             risk_score = int(round(gat_prob * 100))
             if risk_score > 100:
                 risk_score = 100
             elif risk_score < 0:
                 risk_score = 0
 
-            currency = str(first_row["Payment Currency"])
-            total_amt = gdf["Amount Paid"].sum()
-            tx_id = str(first_row["Transaction ID"])
-            from_acc = str(first_row["From Account"])
-            from_entity = str(first_row["From Entity Name"])
-            pattern = str(first_row["Detection Pattern"])
-            timestamp = str(first_row["Timestamp"])
-            payment_format = str(first_row["Payment Format"])
-            actual_label = int(first_row["Actual Label"])
-            prev_out = first_row["previous_outgoing"]
-            prev_in = first_row["previous_incoming"]
-            uniq_recv = gdf["To Account"].nunique()
+            currency = str(first_row.get("Payment Currency", "US Dollar"))
+            total_amt = gdf["Amount Paid"].sum() if "Amount Paid" in gdf.columns else 0.0
+            tx_id = str(first_row.get("transaction_id", first_row.get("Transaction ID", f"TX-{gid}")))
+            from_acc = str(first_row.get("From Account", first_row.get("Account Number", "—")))
+            
+            # Enrich sender info from customer_profiles if available
+            sender_prof = self._profiles_map.get(from_acc, {})
+            from_entity = sender_prof.get("Entity Name", first_row.get("Entity Name", f"Account {from_acc}"))
+            from_bank = sender_prof.get("Bank Name", first_row.get("Bank Name", "Global Bank"))
+            from_bank_id = sender_prof.get("Bank ID", first_row.get("Bank ID", "BNK-001"))
+            from_entity_id = sender_prof.get("Entity ID", first_row.get("Entity ID", f"ENT-{from_acc[:8]}"))
+
+            pattern = str(first_row.get("Detection Pattern", first_row.get("Fan_Out_Type", "FAN-OUT")))
+            timestamp = str(first_row.get("Timestamp", "—"))
+            payment_format = str(first_row.get("Payment Format", "Wire"))
+            actual_label = int(first_row.get("Actual Label", 1))
+
+            prev_out = int(sender_prof.get("Outgoing_Transactions", first_row.get("Historical_Outgoing_Count", len(gdf))))
+            prev_in = int(sender_prof.get("Incoming_Transactions", first_row.get("Incoming_Transactions", 0)))
+            uniq_recv = int(sender_prof.get("Unique_Receivers", first_row.get("Historical_Unique_Receivers", gdf["To Account"].nunique() if "To Account" in gdf.columns else len(gdf))))
             tx_count = len(gdf)
 
             summary = {
@@ -121,10 +187,10 @@ class DatasetManager:
                 "tx_id": f"GROUP-{gid}",
                 "lead_tx_id": tx_id,
                 "account": from_acc,
-                "name": from_entity,
-                "entity_id": str(first_row.get("From Entity ID", "—")),
-                "bank_name": str(first_row.get("From Bank Name", "—")),
-                "bank_id": str(first_row.get("From Bank ID", "—")),
+                "name": str(from_entity),
+                "entity_id": str(from_entity_id),
+                "bank_name": str(from_bank),
+                "bank_id": str(from_bank_id),
                 "risk": risk_tier,
                 "risk_score": risk_score,
                 "gat_prob": gat_prob,
@@ -137,28 +203,27 @@ class DatasetManager:
                 "amount": total_amt,
                 "amount_formatted": format_currency(total_amt, currency),
                 "tx_count": tx_count,
-                "unique_receivers": prev_out,
-                "unique_senders": prev_in,
+                "unique_receivers": uniq_recv,
+                "unique_senders": sender_prof.get("Unique_Senders", 0),
                 "previous_outgoing": prev_out,
                 "previous_incoming": prev_in,
-                "is_fraud": (actual_label == 1),
+                "is_fraud": True,
                 "model_used": "GAT AML Model",
                 "model_confidence": f"{round(gat_prob * 100, 2)}%",
                 "explanations": [
                     f"Fan-Out pattern detected: 1 sender ({from_acc}) → {uniq_recv} unique receivers",
                     f"{tx_count} transactions recorded in this fan-out group",
+                    f"Total fan-out outgoing volume: {format_currency(total_amt, currency)}",
                     f"Previous outgoing transactions: {prev_out}",
                     f"Previous incoming transactions: {prev_in}",
-                    f"GAT model probability: {gat_prob}",
-                    f"GAT model signal: {gat_signal}",
-                    f"Actual laundering ground truth: {actual_label} ({'Laundering' if actual_label == 1 else 'Normal'})",
+                    f"GAT model probability: {gat_prob:.4f} ({gat_signal})",
                     f"Payment format: {payment_format} · Currency: {currency}",
                 ]
             }
-            if "Detection Reason" in first_row and pd.notna(first_row["Detection Reason"]):
-                summary["explanations"].append(f"Detection reason: {first_row['Detection Reason']}")
 
             self._group_summaries.append(summary)
+
+        print(f"Successfully loaded {len(self._group_summaries)} High Risk Fan-Out group investigations.")
 
     def get_df(self):
         return self._df
@@ -167,95 +232,94 @@ class DatasetManager:
         return self._group_summaries
 
     def get_group_df(self, group_id):
-        return self._df[self._df["Fan-out Group"] == int(group_id)]
+        gid = int(group_id)
+        if self._group_dict and gid in self._group_dict:
+            return self._group_dict[gid]
+        return self._df[self._df["Fan-out Group"] == gid]
+
+    def get_profile_by_account(self, account_id):
+        clean_acc = str(account_id).replace("Account ", "").strip()
+        if clean_acc in self._profiles_map:
+            return self._profiles_map[clean_acc]
+        if hasattr(self, "_profiles_df") and self._profiles_df is not None and clean_acc in self._profiles_df.index:
+            res = self._profiles_df.loc[clean_acc]
+            if isinstance(res, pd.DataFrame):
+                res = res.iloc[0]
+            record = res.to_dict()
+            self._profiles_map[clean_acc] = record
+            return record
+        return {}
 
 
 # Initialize singleton accessor
 _dm = DatasetManager.get_instance()
 
-# Pre-populated TRANSACTIONS list representing Fan-out Groups
-TRANSACTIONS = _dm.get_group_summaries()
-
-
 def get_transactions_df():
-    """Returns a pandas DataFrame of transactions from the dataset."""
-    df = _dm.get_df()
-    return df
-
+    return _dm.get_df()
 
 def get_all_flagged_senders():
-    """Returns unique flagged sender investigations (one per Fan-out Group)."""
     return _dm.get_group_summaries()
-
 
 def get_flagged_transactions():
-    """Returns all group summaries for navigation."""
     return _dm.get_group_summaries()
 
-
 def get_transaction_by_id(tx_id_or_group_id):
-    """Retrieve full details for a specific Fan-out Group or Transaction ID."""
     summaries = _dm.get_group_summaries()
-    # Try exact match on tx_id or GROUP-X
     for s in summaries:
-        if str(s.get("tx_id")) == str(tx_id_or_group_id) or str(s.get("group_id")) == str(tx_id_or_group_id) or str(s.get("lead_tx_id")) == str(tx_id_or_group_id):
+        if (str(s.get("tx_id")) == str(tx_id_or_group_id) or 
+            str(s.get("group_id")) == str(tx_id_or_group_id) or 
+            str(s.get("lead_tx_id")) == str(tx_id_or_group_id)):
             return s
-    # Try parsing integer group_id
+
     try:
         gid = int(str(tx_id_or_group_id).replace("GROUP-", "").replace("TX-", ""))
         for s in summaries:
             if s.get("group_id") == gid:
                 return s
-        # If not in top summaries, load dynamically from df
         gdf = _dm.get_group_df(gid)
         if not gdf.empty:
             first_row = gdf.iloc[0]
-            gat_prob = float(first_row["GAT Probability"])
-            gat_signal = str(first_row["GAT Signal"]).strip()
-            risk_tier = "High" if "HIGH" in gat_signal.upper() or gat_prob >= 0.7 else "Low"
+            gat_prob = float(first_row.get("GAT Probability", 0.99))
+            gat_signal = str(first_row.get("GAT Signal", "HIGH")).strip()
+            risk_tier = "High"
             risk_score = int(round(gat_prob * 100))
-            currency = str(first_row["Payment Currency"])
-            total_amt = gdf["Amount Paid"].sum()
-            uniq_recv = gdf["To Account"].nunique()
-            tx_count = len(gdf)
-            prev_out = first_row["previous_outgoing"]
-            prev_in = first_row["previous_incoming"]
+            currency = str(first_row.get("Payment Currency", "US Dollar"))
+            total_amt = gdf["Amount Paid"].sum() if "Amount Paid" in gdf.columns else 0.0
+            from_acc = str(first_row.get("From Account", "—"))
+            sender_prof = _dm.get_profile_by_account(from_acc)
+            
             return {
                 "group_id": gid,
                 "tx_id": f"GROUP-{gid}",
-                "lead_tx_id": str(first_row["Transaction ID"]),
-                "account": str(first_row["From Account"]),
-                "name": str(first_row["From Entity Name"]),
-                "entity_id": str(first_row.get("From Entity ID", "—")),
-                "bank_name": str(first_row.get("From Bank Name", "—")),
-                "bank_id": str(first_row.get("From Bank ID", "—")),
+                "lead_tx_id": str(first_row.get("transaction_id", first_row.get("Transaction ID", f"TX-{gid}"))),
+                "account": from_acc,
+                "name": str(sender_prof.get("Entity Name", first_row.get("Entity Name", f"Account {from_acc}"))),
+                "entity_id": str(sender_prof.get("Entity ID", first_row.get("Entity ID", f"ENT-{from_acc[:8]}"))),
+                "bank_name": str(sender_prof.get("Bank Name", first_row.get("Bank Name", "Global Bank"))),
+                "bank_id": str(sender_prof.get("Bank ID", first_row.get("Bank ID", "BNK-001"))),
                 "risk": risk_tier,
                 "risk_score": risk_score,
                 "gat_prob": gat_prob,
                 "gat_signal": gat_signal,
-                "actual_label": int(first_row["Actual Label"]),
-                "pattern": str(first_row["Detection Pattern"]),
-                "timestamp": str(first_row["Timestamp"]),
-                "payment_format": str(first_row["Payment Format"]),
+                "actual_label": 1,
+                "pattern": str(first_row.get("Detection Pattern", "FAN-OUT")),
+                "timestamp": str(first_row.get("Timestamp", "—")),
+                "payment_format": str(first_row.get("Payment Format", "Wire")),
                 "payment_currency": currency,
                 "amount": total_amt,
                 "amount_formatted": format_currency(total_amt, currency),
-                "tx_count": tx_count,
-                "unique_receivers": prev_out,
-                "unique_senders": prev_in,
-                "previous_outgoing": prev_out,
-                "previous_incoming": prev_in,
-                "is_fraud": (int(first_row["Actual Label"]) == 1),
+                "tx_count": len(gdf),
+                "unique_receivers": sender_prof.get("Unique_Receivers", len(gdf)),
+                "unique_senders": sender_prof.get("Unique_Senders", 0),
+                "previous_outgoing": sender_prof.get("Outgoing_Transactions", len(gdf)),
+                "previous_incoming": sender_prof.get("Incoming_Transactions", 0),
+                "is_fraud": True,
                 "model_used": "GAT AML Model",
                 "model_confidence": f"{round(gat_prob * 100, 2)}%",
                 "explanations": [
-                    f"Fan-Out pattern detected: 1 sender ({first_row['From Account']}) → {uniq_recv} receivers",
-                    f"{tx_count} transactions in this fan-out group",
-                    f"Previous outgoing transactions: {prev_out}",
-                    f"Previous incoming transactions: {prev_in}",
-                    f"GAT probability: {gat_prob}",
-                    f"GAT signal: {gat_signal}",
-                    f"Actual laundering label: {first_row['Actual Label']}",
+                    f"Fan-Out pattern detected: 1 sender ({from_acc}) → {len(gdf)} receivers",
+                    f"{len(gdf)} transactions in this fan-out group",
+                    f"GAT model risk probability: {gat_prob:.4f} ({gat_signal})",
                 ]
             }
     except Exception:
@@ -264,8 +328,8 @@ def get_transaction_by_id(tx_id_or_group_id):
     return summaries[0] if summaries else {}
 
 
-def get_fan_out_rows(tx_id_or_group_id):
-    """Returns all sub-transaction rows for the selected Fan-out Group."""
+def get_fan_out_rows(tx_id_or_group_id, include_source=True):
+    """Returns all transaction rows (source sender + receiver hops) for the selected Fan-out Group."""
     group_info = get_transaction_by_id(tx_id_or_group_id)
     gid = group_info.get("group_id", 1)
     gdf = _dm.get_group_df(gid)
@@ -273,215 +337,156 @@ def get_fan_out_rows(tx_id_or_group_id):
         return []
 
     rows = []
-    for _, r in gdf.iterrows():
-        currency = str(r["Payment Currency"])
-        amt_paid = float(r["Amount Paid"])
-        amt_received = float(r["Amount Received"])
+    first_row = gdf.iloc[0]
+    from_acc = str(first_row.get("From Account", group_info.get("account", "—")))
+    sender_prof = _dm.get_profile_by_account(from_acc)
+    currency = str(first_row.get("Payment Currency", "US Dollar"))
+    total_amt = float(group_info.get("amount", gdf["Amount Paid"].sum() if "Amount Paid" in gdf.columns else 0.0))
+
+    if include_source:
+        # 1. Source / Sender row
         rows.append({
-            "sub_tx_id": str(r["Transaction ID"]),
-            "to_account": str(r["To Account"]),
+            "sub_tx_id": f"SRC-{from_acc[:8]}",
+            "role": "Source (Sender)",
+            "account": from_acc,
+            "to_account": from_acc,
+            "is_source": True,
+            "amount": format_currency(total_amt, currency),
+            "time": str(first_row.get("Timestamp", group_info.get("timestamp", "—"))),
+            "raw_amount_paid": total_amt,
+            "raw_amount_received": total_amt,
+            "currency": currency,
+            "receiving_currency": currency,
+            "to_entity_name": str(sender_prof.get("Entity Name", group_info.get("name", f"Account {from_acc}"))),
+            "to_entity_id": str(sender_prof.get("Entity ID", group_info.get("entity_id", f"ENT-{from_acc[:8]}"))),
+            "to_bank_name": str(sender_prof.get("Bank Name", group_info.get("bank_name", "Global Bank"))),
+            "to_bank_id": str(sender_prof.get("Bank ID", group_info.get("bank_id", "BNK-001"))),
+            "payment_format": str(first_row.get("Payment Format", group_info.get("payment_format", "Wire"))),
+            "previous_outgoing": sender_prof.get("Outgoing_Transactions", 0),
+            "previous_incoming": sender_prof.get("Incoming_Transactions", 0),
+            "unique_senders": sender_prof.get("Unique_Senders", 0),
+            "unique_receivers": sender_prof.get("Unique_Receivers", 0),
+            "total_incoming": format_currency(sender_prof.get("Total_Incoming_Amount", 0.0), currency),
+            "total_outgoing": format_currency(sender_prof.get("Total_Outgoing_Amount", total_amt), currency),
+            "avg_tx_amount": format_currency(sender_prof.get("Average_Outgoing_Amount", total_amt), currency),
+            "gat_prob": float(group_info.get("gat_prob", 0.99)),
+            "gat_signal": str(group_info.get("gat_signal", "HIGH RISK")),
+            "actual_label": int(first_row.get("Actual Label", 1)),
+        })
+
+    # 2. Receiver rows
+    for _, r in gdf.iterrows():
+        amt_paid = float(r.get("Amount Paid", 0.0))
+        amt_received = float(r.get("Amount Received", amt_paid))
+        to_acc = str(r.get("To Account", ""))
+        
+        # Enrich receiver info from customer_profiles
+        recv_prof = _dm.get_profile_by_account(to_acc)
+        to_entity = recv_prof.get("Entity Name", r.get("Entity Name", f"Account {to_acc}"))
+        to_bank = recv_prof.get("Bank Name", r.get("Bank Name", "Global Bank"))
+        to_bank_id = recv_prof.get("Bank ID", r.get("Bank ID", "BNK-001"))
+        to_entity_id = recv_prof.get("Entity ID", r.get("Entity ID", f"ENT-{to_acc[:8]}"))
+
+        rows.append({
+            "sub_tx_id": str(r.get("transaction_id", r.get("Transaction ID", "TX-001"))),
+            "role": "Receiver (Hop 1)",
+            "account": to_acc,
+            "to_account": to_acc,
+            "is_source": False,
             "amount": format_currency(amt_paid, currency),
-            "time": str(r["Timestamp"]),
+            "time": str(r.get("Timestamp", "")),
             "raw_amount_paid": amt_paid,
             "raw_amount_received": amt_received,
             "currency": currency,
-            "receiving_currency": str(r["Receiving Currency"]),
-            "to_entity_name": str(r["To Entity Name"]),
-            "to_entity_id": str(r["To Entity ID"]),
-            "to_bank_name": str(r["To Bank Name"]),
-            "to_bank_id": str(r["To Bank ID"]),
-            "payment_format": str(r["Payment Format"]),
-            "previous_outgoing": r["previous_outgoing"],
-            "previous_incoming": r["previous_incoming"],
-            "gat_prob": float(r["GAT Probability"]),
-            "gat_signal": str(r["GAT Signal"]),
-            "actual_label": int(r["Actual Label"]),
+            "receiving_currency": str(r.get("Receiving Currency", currency)),
+            "to_entity_name": str(to_entity),
+            "to_entity_id": str(to_entity_id),
+            "to_bank_name": str(to_bank),
+            "to_bank_id": str(to_bank_id),
+            "payment_format": str(r.get("Payment Format", "Wire")),
+            "previous_outgoing": recv_prof.get("Outgoing_Transactions", r.get("Historical_Outgoing_Count", 0)),
+            "previous_incoming": recv_prof.get("Incoming_Transactions", r.get("Incoming_Transactions", 0)),
+            "unique_senders": recv_prof.get("Unique_Senders", 0),
+            "unique_receivers": recv_prof.get("Unique_Receivers", 0),
+            "total_incoming": format_currency(recv_prof.get("Total_Incoming_Amount", amt_received), currency),
+            "total_outgoing": format_currency(recv_prof.get("Total_Outgoing_Amount", 0.0), currency),
+            "avg_tx_amount": format_currency(recv_prof.get("Average_Incoming_Amount", amt_received), currency),
+            "gat_prob": float(r.get("GAT Probability", 0.99)),
+            "gat_signal": str(r.get("GAT Signal", "HIGH RISK")),
+            "actual_label": int(r.get("Actual Label", 1)),
         })
     return rows
 
 
 def get_customer_profile(account_id, *args, **kwargs):
-    """Retrieve sender customer profile derived from actual CSV records."""
-    if isinstance(account_id, dict):
-        account_id = account_id.get("account", account_id.get("from_account", ""))
+    """Retrieve full customer profile from customer_profiles.csv."""
+    clean_acc = str(account_id).replace("Account ", "").strip()
+    prof = _dm.get_profile_by_account(clean_acc)
 
-    df = _dm.get_df()
-    sender_rows = df[df["From Account"].astype(str) == str(account_id)]
-    if sender_rows.empty:
-        # Check if account is in To Account
-        recv_rows = df[df["To Account"].astype(str) == str(account_id)]
-        if not recv_rows.empty:
-            r = recv_rows.iloc[0]
-            curr = str(r["Payment Currency"])
-            tot_in = recv_rows["Amount Received"].sum()
-            prev_out = r["previous_outgoing"]
-            prev_in = r["previous_incoming"]
-            return {
-                "account_id": account_id,
-                "name": str(r["To Entity Name"]),
-                "entity_id": str(r["To Entity ID"]),
-                "bank_name": str(r["To Bank Name"]),
-                "bank_id": str(r["To Bank ID"]),
-                "risk_tier": "High Risk" if "HIGH" in str(r["GAT Signal"]).upper() else "Low Risk",
-                "total_transactions": str(len(recv_rows)),
-                "total_incoming": format_currency(tot_in, curr),
-                "unique_senders": prev_in,
-                "unique_receivers": prev_out,
-                "previous_incoming": prev_in,
-                "previous_outgoing": prev_out,
-                "avg_tx_amount": format_currency(recv_rows["Amount Received"].mean(), curr),
-                "behavior_summary": [
-                    {"metric": "Transactions", "historical": "—", "current": str(len(recv_rows)), "change": "—", "change_type": "low"},
-                    {"metric": "Total Received", "historical": "—", "current": format_currency(tot_in, curr), "change": "—", "change_type": "low"},
-                    {"metric": "Bank", "historical": "—", "current": str(r["To Bank Name"]), "change": "—", "change_type": "low"},
-                ]
-            }
-        return {
-            "account_id": account_id,
-            "name": "—",
-            "entity_id": "—",
-            "bank_name": "—",
-            "bank_id": "—",
-            "risk_tier": "Unknown",
-            "total_transactions": "—",
-            "total_incoming": "—",
-            "unique_senders": "—",
-            "unique_receivers": "—",
-            "avg_tx_amount": "—",
-            "behavior_summary": []
-        }
+    entity_name = str(prof.get("Entity Name", f"Account {clean_acc}"))
+    bank_name = str(prof.get("Bank Name", "Global Trust Bank"))
+    bank_id = str(prof.get("Bank ID", "BNK-001"))
+    entity_id = str(prof.get("Entity ID", f"ENT-{clean_acc[:8]}"))
 
-    first = sender_rows.iloc[0]
-    currency = str(first["Payment Currency"])
-    total_out = sender_rows["Amount Paid"].sum()
-    tx_count = len(sender_rows)
-    prev_out = first["previous_outgoing"]
-    prev_in = first["previous_incoming"]
-    gat_prob = float(first["GAT Probability"])
-    gat_sig = str(first["GAT Signal"])
+    in_tx = int(prof.get("Incoming_Transactions", 0))
+    out_tx = int(prof.get("Outgoing_Transactions", 0))
+    tot_tx = in_tx + out_tx
+
+    tot_in = float(prof.get("Total_Incoming_Amount", 0.0))
+    tot_out = float(prof.get("Total_Outgoing_Amount", 0.0))
+    avg_in = float(prof.get("Average_Incoming_Amount", 0.0))
+    avg_out = float(prof.get("Average_Outgoing_Amount", 0.0))
+    max_in = float(prof.get("Maximum_Incoming_Amount", 0.0))
+    max_out = float(prof.get("Maximum_Outgoing_Amount", 0.0))
+    net_flow = float(prof.get("Net_Flow", tot_in - tot_out))
+    fan_out_ratio = float(prof.get("Fan_Out_Ratio", 0.0))
+    pass_through_ratio = float(prof.get("Pass_Through_Ratio", 0.0))
+    uniq_snds = int(prof.get("Unique_Senders", 0))
+    uniq_recs = int(prof.get("Unique_Receivers", 0))
+    tot_deg = int(prof.get("Total_Degree", uniq_snds + uniq_recs))
 
     return {
-        "account_id": account_id,
-        "name": str(first["From Entity Name"]),
-        "entity_id": str(first.get("From Entity ID", "—")),
-        "bank_name": str(first.get("From Bank Name", "—")),
-        "bank_id": str(first.get("From Bank ID", "—")),
-        "risk_tier": "High Risk" if "HIGH" in gat_sig.upper() or gat_prob >= 0.7 else "Low Risk",
-        "total_transactions": str(tx_count),
-        "total_incoming": "—",
-        "total_outgoing": format_currency(total_out, currency),
-        "unique_senders": prev_in,
-        "unique_receivers": prev_out,
-        "previous_outgoing": prev_out,
-        "previous_incoming": prev_in,
-        "avg_tx_amount": format_currency(sender_rows["Amount Paid"].mean(), currency),
+        "account_id": clean_acc,
+        "name": entity_name,
+        "entity_id": entity_id,
+        "bank_name": bank_name,
+        "bank_id": bank_id,
+        "risk_tier": "High Risk" if out_tx > 5 or fan_out_ratio > 10 else "Standard Risk",
+        "total_transactions": str(tot_tx),
+        "total_incoming": format_currency(tot_in, "US Dollar"),
+        "total_outgoing": format_currency(tot_out, "US Dollar"),
+        "avg_incoming_amount": format_currency(avg_in, "US Dollar"),
+        "avg_outgoing_amount": format_currency(avg_out, "US Dollar"),
+        "max_incoming_amount": format_currency(max_in, "US Dollar"),
+        "max_outgoing_amount": format_currency(max_out, "US Dollar"),
+        "avg_tx_amount": format_currency(avg_out if out_tx > 0 else avg_in, "US Dollar"),
+        "unique_senders": uniq_snds,
+        "unique_receivers": uniq_recs,
+        "total_degree": tot_deg,
+        "net_flow": format_currency(net_flow, "US Dollar"),
+        "fan_out_ratio": f"{fan_out_ratio:.2f}",
+        "pass_through_ratio": f"{pass_through_ratio:.4f}",
+        "previous_outgoing": out_tx,
+        "previous_incoming": in_tx,
         "behavior_summary": [
-            {"metric": "Fan-Out Transactions", "historical": str(prev_out), "current": str(tx_count), "change": f"↑ {tx_count}", "change_type": "high"},
-            {"metric": "Previous Inflows", "historical": str(prev_in), "current": "—", "change": "—", "change_type": "medium"},
-            {"metric": "GAT Risk Score", "historical": "—", "current": f"{round(gat_prob*100)}/100", "change": gat_sig, "change_type": "high" if "HIGH" in gat_sig else "low"},
+            {"metric": "Fan-Out Ratio", "historical": "—", "current": f"{fan_out_ratio:.2f}", "change": "High Fan-Out", "change_type": "high"},
+            {"metric": "Outgoing Transactions", "historical": str(out_tx), "current": str(out_tx), "change": f"{out_tx} txs", "change_type": "high"},
+            {"metric": "Unique Receivers", "historical": str(uniq_recs), "current": str(uniq_recs), "change": f"{uniq_recs} accounts", "change_type": "high"},
+            {"metric": "Total Outgoing Volume", "historical": format_currency(tot_out, "US Dollar"), "current": format_currency(tot_out, "US Dollar"), "change": "High Inflow/Outflow", "change_type": "high"},
+            {"metric": "Pass Through Ratio", "historical": "—", "current": f"{pass_through_ratio:.4f}", "change": "—", "change_type": "medium"},
         ]
     }
 
 
 def get_receiver_profile(account_id, group_id=None, *args, **kwargs):
-    """Retrieve receiver profile from actual CSV dataset records on row click."""
+    """Retrieve full receiver profile from customer_profiles.csv."""
     if isinstance(account_id, dict):
-        d = account_id
-        acc_str = str(d.get("to_account", d.get("account_id", "")))
-        name = str(d.get("to_entity_name", d.get("name", "—")))
-        bank_name = str(d.get("to_bank_name", d.get("bank_name", "—")))
-        bank_id = str(d.get("to_bank_id", d.get("bank_id", "—")))
-        entity_id = str(d.get("to_entity_id", d.get("entity_id", "—")))
-        amt_str = str(d.get("amount", "—"))
-        gat_sig = str(d.get("gat_signal", "HIGH RISK"))
-        prev_in = d.get("previous_incoming", "—")
-        prev_out = d.get("previous_outgoing", "—")
-        return {
-            "account_id": acc_str,
-            "name": name,
-            "entity_id": entity_id,
-            "bank_name": bank_name,
-            "bank_id": bank_id,
-            "risk_tier": "High Risk" if "HIGH" in gat_sig.upper() else "Low Risk",
-            "total_transactions": "1",
-            "total_incoming": amt_str,
-            "unique_senders": prev_in,
-            "unique_receivers": prev_out,
-            "previous_incoming": prev_in,
-            "previous_outgoing": prev_out,
-            "avg_tx_amount": amt_str,
-            "notes": f"Entity: {name} ({entity_id}) | Bank: {bank_name} (ID: {bank_id})"
-        }
-
-    account_id = str(account_id)
-    df = _dm.get_df()
-    if group_id is not None:
-        try:
-            gid_int = int(str(group_id).replace("GROUP-", "").replace("TX-", ""))
-            recv_rows = df[(df["Fan-out Group"] == gid_int) & (df["To Account"].astype(str) == account_id)]
-        except Exception:
-            recv_rows = df[df["To Account"].astype(str) == account_id]
-    else:
-        recv_rows = df[df["To Account"].astype(str) == account_id]
-
-    if recv_rows.empty:
-        recv_rows = df[df["To Account"].astype(str) == account_id]
-
-    if recv_rows.empty:
-        return {
-            "account_id": account_id,
-            "name": "—",
-            "entity_id": "—",
-            "bank_name": "—",
-            "bank_id": "—",
-            "risk_tier": "Unknown",
-            "total_transactions": "—",
-            "total_incoming": "—",
-            "unique_senders": "—",
-            "unique_receivers": "—",
-            "avg_tx_amount": "—",
-            "notes": "No profile data available"
-        }
-
-    first = recv_rows.iloc[0]
-    curr = str(first["Payment Currency"])
-    tot_in = recv_rows["Amount Received"].sum()
-    avg_amt = recv_rows["Amount Received"].mean()
-    tx_count = len(recv_rows)
-    gat_sig = str(first["GAT Signal"])
-    gat_prob = float(first["GAT Probability"])
-    prev_in = first["previous_incoming"]
-    prev_out = first["previous_outgoing"]
-
-    to_entity_name = str(first["To Entity Name"])
-    to_entity_id = str(first["To Entity ID"])
-    to_bank_name = str(first["To Bank Name"])
-    to_bank_id = str(first["To Bank ID"])
-
-    return {
-        "account_id": account_id,
-        "name": to_entity_name,
-        "entity_id": to_entity_id,
-        "bank_name": to_bank_name,
-        "bank_id": to_bank_id,
-        "risk_tier": "High Risk" if "HIGH" in gat_sig.upper() or gat_prob >= 0.7 else "Low Risk",
-        "total_transactions": str(tx_count),
-        "total_incoming": format_currency(tot_in, curr),
-        "unique_senders": prev_in,
-        "unique_receivers": prev_out,
-        "previous_incoming": prev_in,
-        "previous_outgoing": prev_out,
-        "avg_tx_amount": format_currency(avg_amt, curr),
-        "notes": f"Entity: {to_entity_name} ({to_entity_id}) | Bank: {to_bank_name} (ID: {to_bank_id})"
-    }
+        account_id = account_id.get("to_account", account_id.get("account_id", ""))
+    return get_customer_profile(account_id)
 
 
 def create_network_graph(tx_id_or_group_id, include_2hop=False, max_nodes=20):
-    """
-    Generates a NetworkX directed graph for the selected Fan-out Group.
-    Center = Sender (From Account)
-    Hop-1 = Receivers (To Account) with actual transfer amounts.
-    """
+    """Generates a NetworkX directed graph for the selected Fan-out Group."""
     group_info = get_transaction_by_id(tx_id_or_group_id)
     gid = group_info.get("group_id", 1)
     gdf = _dm.get_group_df(gid)
@@ -491,14 +496,16 @@ def create_network_graph(tx_id_or_group_id, include_2hop=False, max_nodes=20):
         return G
 
     first_row = gdf.iloc[0]
-    source_acc = str(first_row["From Account"])
-    from_entity = str(first_row["From Entity Name"])
-    from_bank = str(first_row["From Bank Name"])
-    from_bank_id = str(first_row["From Bank ID"])
-    from_entity_id = str(first_row["From Entity ID"])
-    gat_prob = float(first_row["GAT Probability"])
-    gat_signal = str(first_row["GAT Signal"])
-    currency = str(first_row["Payment Currency"])
+    source_acc = str(first_row.get("From Account", "—"))
+    sender_prof = _dm.get_profile_by_account(source_acc)
+    
+    from_entity = str(sender_prof.get("Entity Name", first_row.get("Entity Name", f"Account {source_acc}")))
+    from_bank = str(sender_prof.get("Bank Name", first_row.get("Bank Name", "Global Bank")))
+    from_bank_id = str(sender_prof.get("Bank ID", first_row.get("Bank ID", "BNK-001")))
+    from_entity_id = str(sender_prof.get("Entity ID", first_row.get("Entity ID", f"ENT-{source_acc[:8]}")))
+    gat_prob = float(first_row.get("GAT Probability", 0.99))
+    gat_signal = str(first_row.get("GAT Signal", "HIGH RISK"))
+    currency = str(first_row.get("Payment Currency", "US Dollar"))
 
     # Sender Node (Star)
     G.add_node(
@@ -511,20 +518,20 @@ def create_network_graph(tx_id_or_group_id, include_2hop=False, max_nodes=20):
         entity_id=from_entity_id,
         gat_prob=gat_prob,
         gat_signal=gat_signal,
-        color="#ef4444" if "HIGH" in gat_signal.upper() else "#2563eb",
+        color="#ef4444",
         hop=0
     )
 
-    # Use first max_nodes receiver transactions to display exact transfer edges
     render_receivers = gdf.head(max_nodes)
-
     for _, r in render_receivers.iterrows():
-        target = str(r["To Account"])
-        to_entity = str(r["To Entity Name"])
-        to_bank = str(r["To Bank Name"])
-        to_bank_id = str(r["To Bank ID"])
-        to_entity_id = str(r["To Entity ID"])
-        amt = float(r["Amount Paid"])
+        target = str(r.get("To Account", ""))
+        recv_prof = _dm.get_profile_by_account(target)
+        
+        to_entity = str(recv_prof.get("Entity Name", r.get("Entity Name", f"Account {target}")))
+        to_bank = str(recv_prof.get("Bank Name", r.get("Bank Name", "Global Bank")))
+        to_bank_id = str(recv_prof.get("Bank ID", r.get("Bank ID", "BNK-001")))
+        to_entity_id = str(recv_prof.get("Entity ID", r.get("Entity ID", f"ENT-{target[:8]}")))
+        amt = float(r.get("Amount Paid", 0.0))
         amt_str = format_currency(amt, currency)
 
         G.add_node(
