@@ -490,7 +490,6 @@ def get_customer_profile(account_id, *args, **kwargs):
         "entity_id": entity_id,
         "bank_name": bank_name,
         "bank_id": bank_id,
-        "risk_tier": "High Risk" if out_tx > 5 or fan_out_ratio > 10 else "Standard Risk",
         "total_transactions": str(tot_tx),
         "total_incoming": format_currency(tot_in, "US Dollar"),
         "total_outgoing": format_currency(tot_out, "US Dollar"),

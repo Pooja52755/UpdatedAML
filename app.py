@@ -241,10 +241,10 @@ with st.sidebar:
     """))
 
     # If goto_graph flag is set, pre-select the graph page
-    default_page_idx = 2 if st.session_state.goto_graph else 0
+    default_page_idx = 1 if st.session_state.goto_graph else 0
     page = st.radio(
         "Navigation",
-        ["Dashboard", "Transactions", "Alerts / Graph Network", "Customers", "Reports", "Settings", "Help"],
+        ["Dashboard", "Alerts / Graph Network"],
         index=default_page_idx,
         label_visibility="collapsed"
     )
@@ -288,9 +288,8 @@ if page == "Dashboard":
     <div class="top-banner">
         <div class="top-banner-icon">📋</div>
         <div>
-            <div style="font-size:12px;color:#64748b;font-weight:600;">Total Transactions in Dataset</div>
+            <div style="font-size:12px;color:#64748b;font-weight:600;">Total Transactions</div>
             <div class="banner-value">{total_txs_count}</div>
-            <div class="banner-subtext">Authoritative Fan-Out Groups</div>
         </div>
         <div style="margin-left:30px;">
             <div style="font-size:12px;color:#64748b;font-weight:600;">High Risk Groups</div>
@@ -712,15 +711,11 @@ elif page == "Alerts / Graph Network":
     default_sel = st.session_state.selected_tx_id
     default_idx = group_options.index(default_sel) if default_sel in group_options else 0
 
-    col_g1, col_g2 = st.columns([2, 1])
-    with col_g1:
-        sel_tx = st.selectbox(
-            "Select Fan-out Group Network to Inspect",
-            group_options,
-            index=default_idx
-        )
-    with col_g2:
-        show_2hop = st.checkbox("Show 2-Hop Neighbors", value=False, disabled=True, help="Hop-2 nodes are derived only when complete downstream data is available in the dataset.")
+    sel_tx = st.selectbox(
+        "Select Fan-out Group Network to Inspect",
+        group_options,
+        index=default_idx
+    )
 
     tx_info = fraud_data.get_transaction_by_id(sel_tx)
 
