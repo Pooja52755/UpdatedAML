@@ -47,7 +47,7 @@ st.html(textwrap.dedent("""
         display:inline-block;
     }
     .badge-low {
-        background:#f0fdf4; color:#16a34a; border:1px solid #bbf7d0;
+        background:#fef2f2; color:#dc2626; border:1px solid #fecaca;
         padding:3px 10px; border-radius:6px; font-size:11px; font-weight:700;
         display:inline-block;
     }
@@ -75,7 +75,7 @@ st.html(textwrap.dedent("""
     .flagged-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
     .flagged-card-high { border-left-color: #ef4444 !important; }
     .flagged-card-medium { border-left-color: #f59e0b !important; }
-    .flagged-card-low { border-left-color: #16a34a !important; }
+    .flagged-card-low { border-left-color: #dc2626 !important; }
     .flagged-card-selected { background:#eff6ff; border-color:#93c5fd; }
     .flagged-acc-id { font-weight:700; font-size:13px; color:#1e40af; }
     .flagged-pattern { font-size:11px; color:#64748b; margin-top:3px; }
@@ -304,8 +304,8 @@ if page == "Dashboard":
         </div>
         <div style="margin-left:30px;">
             <div style="font-size:12px;color:#64748b;font-weight:600;">Low Risk Groups</div>
-            <div style="font-size:26px;font-weight:800;color:#16a34a;">{low_count}</div>
-            <div style="font-size:12px;color:#16a34a;font-weight:600;">Low Priority</div>
+            <div style="font-size:26px;font-weight:800;color:#dc2626;">{low_count}</div>
+            <div style="font-size:12px;color:#dc2626;font-weight:600;">Low Priority</div>
         </div>
         <div style="margin-left:auto;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 18px;text-align:center;">
             <div style="font-size:11px;color:#16a34a;font-weight:700;">GAT MODEL</div>
@@ -324,8 +324,11 @@ if page == "Dashboard":
         st.html('<div class="section-label">🚨 Flagged Sender Investigations</div>')
 
         all_txs = fraud_data.get_all_flagged_senders()
+        
+        # Only show groups that still need investigation in the sidebar inbox
+        visible_txs = [tx for tx in all_txs if tx.get("risk") in ["High", "Medium"]]
 
-        for tx in all_txs:
+        for tx in visible_txs:
             acc = tx.get("account", "Unknown")
             name = tx.get("name") or fraud_data.get_customer_profile(acc).get("name", acc)
             risk = tx.get("risk", "High")
@@ -335,7 +338,7 @@ if page == "Dashboard":
             tx_id = tx.get("tx_id", f"GROUP-{gid}")
             is_sel = (tx_id == st.session_state.selected_tx_id or str(gid) == str(st.session_state.selected_tx_id))
 
-            risk_color = "#ef4444" if risk == "High" else "#f59e0b" if risk == "Medium" else "#16a34a"
+            risk_color = "#ef4444" if risk == "High" else "#f59e0b" if risk == "Medium" else "#dc2626"
             sel_bg = "#eff6ff" if is_sel else "#ffffff"
             sel_border = "#93c5fd" if is_sel else "#e2e8f0"
             bar_width = max(5, min(100, score))
@@ -463,6 +466,11 @@ if page == "Dashboard":
         # ── Authorised Bank Auditor Decision Panel (HIGH & MEDIUM RISK) ──
         if is_high or risk == "Medium":
             tx_key = curr_tx.get("tx_id", f"GROUP-{gid}")
+
+            # Pre-seed session state from persistent storage if it exists
+            if tx_key not in st.session_state.human_decision_submitted and "analyst_decision" in curr_tx:
+                st.session_state.human_decision_submitted[tx_key] = curr_tx["analyst_decision"]
+
             already_submitted = st.session_state.human_decision_submitted.get(tx_key)
 
             st.html(textwrap.dedent(f"""
@@ -509,11 +517,28 @@ if page == "Dashboard":
                 """)
 
                 if st.button(f"📋 Submit Decision for Group {gid}", key=f"submit_{tx_key}", type="primary", use_container_width=True):
+                    timestamp = datetime.now().strftime("%d %b %Y, %I:%M %p")
                     st.session_state.human_decision_submitted[tx_key] = {
                         "decision": decision,
                         "notes": notes,
-                        "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p")
+                        "timestamp": timestamp
                     }
+                    
+                    # Persist decision to the database backend
+                    fraud_data.record_analyst_decision(tx_key, decision, notes, timestamp)
+                    
+                    # If approved, navigate to the next remaining high-risk group
+                    if "Approve" in decision:
+                        still_high = [
+                            s for s in fraud_data.get_all_flagged_senders()
+                            if s["risk"] == "High" and s["tx_id"] != tx_key
+                        ]
+                        if still_high:
+                            st.session_state.selected_tx_id = still_high[0]["tx_id"]
+                        else:
+                            st.session_state.selected_tx_id = "GROUP-1"
+                        st.session_state.selected_sub_tx = None
+                    
                     st.rerun()
 
         # ── AI Advisory (COMPLETELY AT BOTTOM) ──
@@ -581,7 +606,7 @@ if page == "Dashboard":
         net_flow = profile.get("net_flow", "—")
 
         risk_tier = profile.get("risk_tier", "High Risk" if "HIGH" in str(sub_tx.get("gat_signal", "HIGH")).upper() else ("Medium Risk" if "MEDIUM" in str(sub_tx.get("gat_signal", "")).upper() else "Low Risk"))
-        tier_color = "#dc2626" if "High" in risk_tier else "#d97706" if "Medium" in risk_tier else "#16a34a"
+        tier_color = "#dc2626" if "High" in risk_tier else "#d97706" if "Medium" in risk_tier else "#dc2626"
         payment_fmt = str(sub_tx.get('payment_format', '—'))
 
         beh_rows = [
@@ -700,7 +725,7 @@ elif page == "Alerts / Graph Network":
     tx_info = fraud_data.get_transaction_by_id(sel_tx)
 
     # Info bar
-    risk_col = "#dc2626" if tx_info.get("risk") == "High" else "#d97706" if tx_info.get("risk") == "Medium" else "#16a34a"
+    risk_col = "#dc2626" if tx_info.get("risk") == "High" else "#d97706" if tx_info.get("risk") == "Medium" else "#dc2626"
     st.html(textwrap.dedent(f"""
     <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;
                 padding:14px 18px;margin-bottom:16px;display:flex;gap:28px;align-items:center;">

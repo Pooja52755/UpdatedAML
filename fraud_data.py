@@ -7,10 +7,34 @@ Provides complete account profiling and graph topology.
 
 import os
 import glob
+import json
 import pandas as pd
 import numpy as np
 import networkx as nx
 from datetime import datetime
+
+# ─── Persistent Analyst Decisions Store ────────────────────────────────────
+_DECISIONS_FILE = os.path.join(os.path.dirname(__file__), "analyst_decisions.json")
+
+def _load_decisions() -> dict:
+    """Return a dictionary of group_id (int) -> decision_data."""
+    if os.path.exists(_DECISIONS_FILE):
+        try:
+            with open(_DECISIONS_FILE, "r") as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
+
+def _save_decisions(decisions_dict: dict):
+    """Persist the decisions dictionary to disk."""
+    try:
+        with open(_DECISIONS_FILE, "w") as f:
+            json.dump(decisions_dict, f, indent=4)
+    except Exception:
+        pass
+# ────────────────────────────────────────────────────────────────
 
 GITDATA_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "GitData")
@@ -222,6 +246,21 @@ class DatasetManager:
             }
 
             self._group_summaries.append(summary)
+
+        # ── Apply persistent analyst decisions on startup ─────────────────
+        decisions = _load_decisions()
+        for s in self._group_summaries:
+            gid = int(s["group_id"])
+            if gid in decisions:
+                decision_data = decisions[gid]
+                s["analyst_decision"] = decision_data
+                # If the analyst approved it, downgrade the risk status immediately
+                if "Approve" in decision_data.get("decision", ""):
+                    s["risk"] = "Low"
+                    s["risk_score"] = min(s["risk_score"], 10)
+                    s["is_fraud"] = False
+                    s["is_legitimate"] = True
+        # ────────────────────────────────────────────────────────────────
 
         print(f"Successfully loaded {len(self._group_summaries)} High Risk Fan-Out group investigations.")
 
@@ -549,3 +588,62 @@ def create_network_graph(tx_id_or_group_id, include_2hop=False, max_nodes=20):
         G.add_edge(source_acc, target, amount=amt_str, raw_amount=amt, currency=currency, hop=1)
 
     return G
+
+
+# ─── Record Analyst Decision ─────────────────────────────────────
+def record_analyst_decision(tx_id_or_group_id, decision: str, notes: str, timestamp: str) -> bool:
+    """Persistently records an analyst decision for a fan-out group.
+
+    - Mutates the DatasetManager singleton's in-memory _group_summaries immediately.
+    - Writes the decision to analyst_decisions.json so it survives restarts.
+    - If decision is 'Approve', it downgrades the risk to Low.
+
+    Returns True if the group was found and updated, False otherwise.
+    """
+    summaries = _dm.get_group_summaries()
+
+    # Resolve group_id
+    target_gid = None
+    for s in summaries:
+        if (
+            str(s.get("tx_id")) == str(tx_id_or_group_id)
+            or str(s.get("group_id")) == str(tx_id_or_group_id)
+            or str(s.get("lead_tx_id")) == str(tx_id_or_group_id)
+        ):
+            target_gid = int(s["group_id"])
+            break
+
+    if target_gid is None:
+        try:
+            target_gid = int(
+                str(tx_id_or_group_id).replace("GROUP-", "").replace("TX-", "")
+            )
+        except (ValueError, AttributeError):
+            return False
+
+    decision_data = {
+        "decision": decision,
+        "notes": notes,
+        "timestamp": timestamp
+    }
+
+    # 1. Mutate in-memory list right now
+    updated = False
+    for s in summaries:
+        if int(s.get("group_id", -1)) == target_gid:
+            s["analyst_decision"] = decision_data
+            if "Approve" in decision:
+                s["risk"] = "Low"
+                s["risk_score"] = min(int(s.get("risk_score", 10)), 10)
+                s["is_fraud"] = False
+                s["is_legitimate"] = True
+            updated = True
+
+    if not updated:
+        return False
+
+    # 2. Persist to disk
+    decisions = _load_decisions()
+    decisions[str(target_gid)] = decision_data
+    _save_decisions(decisions)
+    return True
