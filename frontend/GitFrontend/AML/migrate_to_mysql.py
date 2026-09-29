@@ -4,10 +4,11 @@ import pandas as pd
 import mysql.connector
 from sqlalchemy import create_engine
 
-# MySQL connection details
-DB_HOST = "localhost"
-DB_USER = "root"
-DB_PASSWORD = "Aryan@#1612"
+# TiDB connection details
+DB_HOST = "gateway01.ap-northeast-1.prod.aws.tidbcloud.com"
+DB_PORT = 4000
+DB_USER = "3JTMKeEP2m268Uk.root"
+DB_PASSWORD = "KUOElkUyvNZX8HBL"
 DB_NAME = "aml_fraud_db"
 
 def find_file(pattern, directory):
@@ -22,8 +23,11 @@ def migrate_data():
     try:
         conn = mysql.connector.connect(
             host=DB_HOST,
+            port=DB_PORT,
             user=DB_USER,
-            password=DB_PASSWORD
+            password=DB_PASSWORD,
+            ssl_verify_cert=True,
+            ssl_verify_identity=True
         )
         cursor = conn.cursor()
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME};")
@@ -37,7 +41,10 @@ def migrate_data():
     # Use SQLAlchemy for pandas to_sql
     import urllib.parse
     encoded_password = urllib.parse.quote_plus(DB_PASSWORD)
-    engine = create_engine(f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}/{DB_NAME}")
+    engine = create_engine(
+        f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+        connect_args={"ssl": {"ssl_cert": None}} # PyMySQL basic SSL for TiDB
+    )
 
     gitdata_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "GitData"))
     print(f"Looking for data in: {gitdata_dir}")

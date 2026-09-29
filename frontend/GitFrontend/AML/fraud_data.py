@@ -104,13 +104,18 @@ class DatasetManager:
         # Connect to MySQL Database
         import urllib.parse
         from sqlalchemy import create_engine
+        import streamlit as st
         
-        DB_HOST = "localhost"
-        DB_USER = "root"
-        DB_PASSWORD = "Aryan@#1612"
-        DB_NAME = "aml_fraud_db"
+        DB_HOST = st.secrets.get("DB_HOST", "gateway01.ap-northeast-1.prod.aws.tidbcloud.com")
+        DB_PORT = st.secrets.get("DB_PORT", 4000)
+        DB_USER = st.secrets.get("DB_USER", "3JTMKeEP2m268Uk.root")
+        DB_PASSWORD = st.secrets.get("DB_PASSWORD", "KUOElkUyvNZX8HBL")
+        DB_NAME = st.secrets.get("DB_NAME", "aml_fraud_db")
         encoded_password = urllib.parse.quote_plus(DB_PASSWORD)
-        engine = create_engine(f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}/{DB_NAME}")
+        engine = create_engine(
+            f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+            connect_args={"ssl": {"ssl_cert": None}}
+        )
 
         # 1. Load Transactions Dataset
         print(f"Loading transactions dataset from MySQL...")

@@ -7,11 +7,21 @@ def record_analyst_decision(tx_id, decision, notes, timestamp):
     """
     import mysql.connector
     try:
+        import streamlit as st
+        DB_HOST = st.secrets.get("DB_HOST", "gateway01.ap-northeast-1.prod.aws.tidbcloud.com")
+        DB_PORT = st.secrets.get("DB_PORT", 4000)
+        DB_USER = st.secrets.get("DB_USER", "3JTMKeEP2m268Uk.root")
+        DB_PASSWORD = st.secrets.get("DB_PASSWORD", "KUOElkUyvNZX8HBL")
+        DB_NAME = st.secrets.get("DB_NAME", "aml_fraud_db")
+        
         conn = mysql.connector.connect(
-            host="localhost",
-            user="root",
-            password="Aryan@#1612",
-            database="aml_fraud_db"
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            ssl_verify_cert=True,
+            ssl_verify_identity=True
         )
         cursor = conn.cursor()
         
@@ -38,11 +48,21 @@ def get_analyst_decisions():
     import mysql.connector
     decisions = {}
     try:
+        import streamlit as st
+        DB_HOST = st.secrets.get("DB_HOST", "gateway01.ap-northeast-1.prod.aws.tidbcloud.com")
+        DB_PORT = st.secrets.get("DB_PORT", 4000)
+        DB_USER = st.secrets.get("DB_USER", "3JTMKeEP2m268Uk.root")
+        DB_PASSWORD = st.secrets.get("DB_PASSWORD", "KUOElkUyvNZX8HBL")
+        DB_NAME = st.secrets.get("DB_NAME", "aml_fraud_db")
+        
         conn = mysql.connector.connect(
-            host="localhost",
-            user="root",
-            password="Aryan@#1612",
-            database="aml_fraud_db"
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            ssl_verify_cert=True,
+            ssl_verify_identity=True
         )
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT * FROM analyst_decisions")
