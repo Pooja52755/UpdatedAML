@@ -1,0 +1,26 @@
+{
+    "TX-VAL-00001": {
+        "decision": "\ud83d\udeab Block Transaction",
+        "notes": "",
+        "review_state": "FLAGGED",
+        "timestamp": "2026-09-25T18:18:43.040319"
+    },
+    "817F973B0": {
+        "decision": "\ud83d\udeab Block Transaction",
+        "notes": "",
+        "review_state": "FLAGGED",
+        "timestamp": "2026-09-25T18:18:43.040319"
+    },
+    "A5F90B7BF932AF35": {
+        "decision": "\ud83d\udeab Block Transaction",
+        "notes": "",
+        "review_state": "FLAGGED",
+        "timestamp": "2026-09-25T20:52:29.930867"
+    },
+    "107526C80": {
+        "decision": "\ud83d\udeab Block Transaction",
+        "notes": "",
+        "review_state": "FLAGGED",
+        "timestamp": "2026-09-25T20:52:29.930867"
+    }
+}
